@@ -21,6 +21,91 @@ from pg_mcp.models.schema import (
 from pg_mcp.services.sql_generator import SQLGenerator
 
 
+@pytest.fixture
+def mock_schema() -> DatabaseSchema:
+    """Create mock database schema (shared by generation test classes)."""
+    users_table = TableInfo(
+        schema_name="public",
+        table_name="users",
+        columns=[
+            ColumnInfo(
+                name="id",
+                data_type="integer",
+                is_nullable=False,
+                is_primary_key=True,
+            ),
+            ColumnInfo(
+                name="name",
+                data_type="varchar(255)",
+                is_nullable=False,
+            ),
+            ColumnInfo(
+                name="email",
+                data_type="varchar(255)",
+                is_nullable=False,
+                is_unique=True,
+            ),
+            ColumnInfo(
+                name="created_at",
+                data_type="timestamp",
+                is_nullable=False,
+                default_value="CURRENT_TIMESTAMP",
+            ),
+        ],
+        indexes=[
+            IndexInfo(
+                name="idx_users_email",
+                columns=["email"],
+                is_unique=True,
+                index_type="btree",
+            ),
+        ],
+    )
+
+    orders_table = TableInfo(
+        schema_name="public",
+        table_name="orders",
+        columns=[
+            ColumnInfo(
+                name="id",
+                data_type="integer",
+                is_nullable=False,
+                is_primary_key=True,
+            ),
+            ColumnInfo(
+                name="user_id",
+                data_type="integer",
+                is_nullable=False,
+            ),
+            ColumnInfo(
+                name="amount",
+                data_type="decimal(10,2)",
+                is_nullable=False,
+            ),
+            ColumnInfo(
+                name="created_at",
+                data_type="timestamp",
+                is_nullable=False,
+                default_value="CURRENT_TIMESTAMP",
+            ),
+        ],
+        foreign_keys=[
+            ForeignKeyInfo(
+                constraint_name="fk_orders_user",
+                column_name="user_id",
+                referenced_table="users",
+                referenced_column="id",
+            ),
+        ],
+    )
+
+    return DatabaseSchema(
+        database_name="test_db",
+        tables=[users_table, orders_table],
+        version="15.0",
+    )
+
+
 class TestSQLExtraction:
     """Test SQL extraction logic from various response formats."""
 
@@ -190,90 +275,6 @@ class TestSQLGenerator:
     def generator(self, config: OpenAIConfig) -> SQLGenerator:
         """Create SQLGenerator instance."""
         return SQLGenerator(config)
-
-    @pytest.fixture
-    def mock_schema(self) -> DatabaseSchema:
-        """Create mock database schema."""
-        users_table = TableInfo(
-            schema_name="public",
-            table_name="users",
-            columns=[
-                ColumnInfo(
-                    name="id",
-                    data_type="integer",
-                    is_nullable=False,
-                    is_primary_key=True,
-                ),
-                ColumnInfo(
-                    name="name",
-                    data_type="varchar(255)",
-                    is_nullable=False,
-                ),
-                ColumnInfo(
-                    name="email",
-                    data_type="varchar(255)",
-                    is_nullable=False,
-                    is_unique=True,
-                ),
-                ColumnInfo(
-                    name="created_at",
-                    data_type="timestamp",
-                    is_nullable=False,
-                    default_value="CURRENT_TIMESTAMP",
-                ),
-            ],
-            indexes=[
-                IndexInfo(
-                    name="idx_users_email",
-                    columns=["email"],
-                    is_unique=True,
-                    index_type="btree",
-                ),
-            ],
-        )
-
-        orders_table = TableInfo(
-            schema_name="public",
-            table_name="orders",
-            columns=[
-                ColumnInfo(
-                    name="id",
-                    data_type="integer",
-                    is_nullable=False,
-                    is_primary_key=True,
-                ),
-                ColumnInfo(
-                    name="user_id",
-                    data_type="integer",
-                    is_nullable=False,
-                ),
-                ColumnInfo(
-                    name="amount",
-                    data_type="decimal(10,2)",
-                    is_nullable=False,
-                ),
-                ColumnInfo(
-                    name="created_at",
-                    data_type="timestamp",
-                    is_nullable=False,
-                    default_value="CURRENT_TIMESTAMP",
-                ),
-            ],
-            foreign_keys=[
-                ForeignKeyInfo(
-                    constraint_name="fk_orders_user",
-                    column_name="user_id",
-                    referenced_table="users",
-                    referenced_column="id",
-                ),
-            ],
-        )
-
-        return DatabaseSchema(
-            database_name="test_db",
-            tables=[users_table, orders_table],
-            version="15.0",
-        )
 
     @pytest.mark.asyncio
     async def test_generate_simple_query(
@@ -545,3 +546,104 @@ LIMIT 10;"""
 
             assert "OpenAI API request failed" in str(exc_info.value)
             assert exc_info.value.details["error"] == "Unknown error occurred"
+
+
+class TestStructuredJSONOutput:
+    """Test the structured JSON output path with regex fallback."""
+
+    @pytest.fixture
+    def generator(self) -> SQLGenerator:
+        """Create SQLGenerator instance with test config."""
+        config = OpenAIConfig(api_key=SecretStr("sk-test-key-12345"))
+        return SQLGenerator(config)
+
+    @pytest.mark.asyncio
+    async def test_json_response_parsed(
+        self, generator: SQLGenerator, mock_schema: DatabaseSchema
+    ) -> None:
+        """Well-formed {"sql": ...} responses are parsed directly."""
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(message=MagicMock(content='{"sql": "SELECT COUNT(*) FROM users"}'))
+        ]
+
+        with patch.object(
+            generator.client.chat.completions, "create", new=AsyncMock(return_value=mock_response)
+        ) as mock_create:
+            result = await generator.generate("How many users?", mock_schema)
+
+            assert result == "SELECT COUNT(*) FROM users;"
+            # Structured output is requested from the API.
+            call_kwargs = mock_create.call_args.kwargs
+            assert call_kwargs["response_format"] == {"type": "json_object"}
+
+    @pytest.mark.asyncio
+    async def test_json_response_normalizes_semicolon(
+        self, generator: SQLGenerator, mock_schema: DatabaseSchema
+    ) -> None:
+        """Trailing semicolons are normalized like the fallback path."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock(message=MagicMock(content='{"sql": "SELECT 1;;;"}'))]
+
+        with patch.object(
+            generator.client.chat.completions, "create", new=AsyncMock(return_value=mock_response)
+        ):
+            result = await generator.generate("Test", mock_schema)
+            assert result == "SELECT 1;"
+
+    def test_json_missing_sql_key_returns_none(self, generator: SQLGenerator) -> None:
+        """JSON without a "sql" key is rejected (no silent wrong-key reads)."""
+        assert generator._sql_from_json('{"query": "SELECT 1"}') is None
+
+    def test_json_non_dict_returns_none(self, generator: SQLGenerator) -> None:
+        assert generator._sql_from_json('"SELECT 1"') is None
+        assert generator._sql_from_json("123") is None
+
+    def test_json_invalid_returns_none(self, generator: SQLGenerator) -> None:
+        assert generator._sql_from_json("```sql\nSELECT 1;\n```") is None
+
+    @pytest.mark.asyncio
+    async def test_legacy_code_block_response_falls_back(
+        self, generator: SQLGenerator, mock_schema: DatabaseSchema
+    ) -> None:
+        """Non-JSON responses still work through the regex fallback."""
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(message=MagicMock(content="```sql\nSELECT * FROM users;\n```"))
+        ]
+
+        with patch.object(
+            generator.client.chat.completions, "create", new=AsyncMock(return_value=mock_response)
+        ):
+            result = await generator.generate("List users", mock_schema)
+            assert result == "SELECT * FROM users;"
+
+    @pytest.mark.asyncio
+    async def test_unparseable_response_raises(
+        self, generator: SQLGenerator, mock_schema: DatabaseSchema
+    ) -> None:
+        """Content with neither JSON nor extractable SQL raises the original error."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock(message=MagicMock(content="Sorry, I cannot help."))]
+
+        with (
+            patch.object(
+                generator.client.chat.completions,
+                "create",
+                new=AsyncMock(return_value=mock_response),
+            ),
+            pytest.raises(LLMError, match="Failed to extract SQL"),
+        ):
+            await generator.generate("Count users", mock_schema)
+
+    @pytest.mark.asyncio
+    async def test_non_standard_response_raises_diagnosable_error(
+        self, generator: SQLGenerator, mock_schema: DatabaseSchema
+    ) -> None:
+        """A non-ChatCompletion body (e.g. HTML from a wrong base_url) raises LLMError."""
+        mock_response = MagicMock(content="not a completion object", spec=["content"])
+
+        with patch.object(
+            generator.client.chat.completions, "create", new=AsyncMock(return_value=mock_response)
+        ), pytest.raises(LLMError, match="non-standard response"):
+            await generator.generate("Count users", mock_schema)

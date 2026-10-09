@@ -111,6 +111,10 @@ finally:
     if _pools is not None:
         await close_pools(_pools, timeout=5.0)
 
+    # ✓ Close the shared OpenAI client (added with the llm/ package)
+    if _llm_client is not None:
+        await _llm_client.close()
+
     logger.info("Shutdown complete")
 ```
 
@@ -142,6 +146,7 @@ finally:
    [INFO] Schema auto-refresh stopped
    [INFO] Connection pool for 'postgres' closed gracefully
    [INFO] Database connection pools closed
+   [INFO] Shared OpenAI client closed
    [INFO] PostgreSQL MCP Server shutdown complete
    ```
 
@@ -173,6 +178,7 @@ Shutdown duration: 2.34 seconds
 |-------|-----------|---------|------------------|
 | 1 | Stop schema refresh | 3s | < 0.1s (immediate cancel) |
 | 2 | Close connection pool | 5s | 0.5-2s (graceful) or 5s (forced) |
+| 3 | Close shared OpenAI client | — | < 0.1s |
 | **Total** | **Full shutdown** | **8s max** | **< 3s typically** |
 
 ## Graceful vs Forced Termination

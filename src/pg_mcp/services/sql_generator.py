@@ -4,13 +4,15 @@ This module provides the SQLGenerator class that uses OpenAI's LLM to convert
 natural language questions into valid PostgreSQL SQL queries.
 """
 
+import json
 import re
 from typing import TYPE_CHECKING
 
 from openai import AsyncOpenAI
 
 from pg_mcp.config.settings import OpenAIConfig
-from pg_mcp.models.errors import LLMError, LLMTimeoutError, LLMUnavailableError
+from pg_mcp.llm import create_openai_client, translate_openai_error
+from pg_mcp.models.errors import LLMError, LLMTimeoutError
 from pg_mcp.prompts.sql_generation import SQL_GENERATION_SYSTEM_PROMPT, build_user_prompt
 
 if TYPE_CHECKING:
@@ -35,18 +37,18 @@ class SQLGenerator:
         ... )
     """
 
-    def __init__(self, config: OpenAIConfig) -> None:
+    def __init__(self, config: OpenAIConfig, client: AsyncOpenAI | None = None) -> None:
         """Initialize SQL generator with OpenAI configuration.
 
         Args:
             config: OpenAI configuration including API key and model settings.
+            client: Optional pre-configured ``AsyncOpenAI`` client to share
+                across services. A per-request timeout is applied on every
+                call, so a shared client still honors ``config.timeout``.
+                Defaults to a client built from ``config``.
         """
         self.config = config
-        self.client = AsyncOpenAI(
-            api_key=config.api_key.get_secret_value(),
-            base_url=config.base_url,
-            timeout=config.timeout,
-        )
+        self.client = client if client is not None else create_openai_client(config, config.timeout)
 
     async def generate(
         self,
@@ -108,6 +110,8 @@ class SQLGenerator:
                 ],
                 temperature=self.config.temperature,
                 max_tokens=self.config.max_tokens,
+                response_format={"type": "json_object"},  # Structured SQL output
+                timeout=self.config.timeout,
             )
         except TimeoutError as e:
             raise LLMTimeoutError(
@@ -115,24 +119,22 @@ class SQLGenerator:
                 details={"timeout": self.config.timeout},
             ) from e
         except Exception as e:
-            # Handle various OpenAI errors
-            error_msg = str(e)
-            if "authentication" in error_msg.lower() or "api_key" in error_msg.lower():
-                raise LLMUnavailableError(
-                    message="OpenAI API authentication failed - check API key",
-                    details={"error": error_msg},
-                ) from e
-            if "rate_limit" in error_msg.lower():
-                raise LLMUnavailableError(
-                    message="OpenAI API rate limit exceeded",
-                    details={"error": error_msg},
-                ) from e
-            raise LLMError(
-                message=f"OpenAI API request failed: {error_msg}",
-                details={"error": error_msg},
-            ) from e
+            # Classify via the shared OpenAI error translation (typed
+            # exceptions first, message-substring fallback).
+            raise translate_openai_error(e, "OpenAI API request") from e
 
         # Extract SQL from response
+        if not hasattr(response, "choices"):
+            # Misconfigured base_url or incompatible gateway: the SDK hands
+            # back the raw body (e.g. an HTML page as a plain string).
+            raise LLMError(
+                message=(
+                    "OpenAI returned a non-standard response - "
+                    "check that OPENAI_BASE_URL points to the API root (e.g. /v1)"
+                ),
+                details={"response_type": type(response).__name__},
+            )
+
         if not response.choices:
             raise LLMError(
                 message="OpenAI returned empty response",
@@ -146,7 +148,7 @@ class SQLGenerator:
                 details={"response": response.model_dump()},
             )
 
-        sql = self._extract_sql(content)
+        sql = self._sql_from_json(content) or self._extract_sql(content)
         if not sql:
             raise LLMError(
                 message="Failed to extract SQL from OpenAI response",
@@ -154,6 +156,42 @@ class SQLGenerator:
             )
 
         return sql
+
+    def _sql_from_json(self, content: str) -> str | None:
+        """Extract the SQL query from a structured JSON response.
+
+        The generation call requests ``response_format={"type": "json_object"}``,
+        so well-behaved responses are JSON objects like ``{"sql": "..."}``.
+        Anything else (plain SQL, markdown fences) falls back to
+        :meth:`_extract_sql`.
+
+        Args:
+            content: Raw content from LLM response.
+
+        Returns:
+            str | None: The SQL query with the same trailing-semicolon
+                normalization as ``_extract_sql``, or None if the content is
+                not a JSON object holding a non-empty "sql" string.
+
+        Example:
+            >>> generator._sql_from_json('{"sql": "SELECT 1"}')
+            'SELECT 1;'
+            >>> generator._sql_from_json("SELECT 1;")  # Not JSON
+            None
+        """
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            return None
+
+        if not isinstance(data, dict):
+            return None
+
+        sql = data.get("sql")
+        if not isinstance(sql, str) or not sql.strip():
+            return None
+
+        return sql.strip().rstrip(";") + ";"
 
     def _extract_sql(self, content: str) -> str | None:
         """Extract SQL query from LLM response content.

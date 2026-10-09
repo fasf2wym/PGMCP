@@ -3,6 +3,10 @@
 This module provides SQL validation and security checking using SQLGlot parser.
 It ensures that only safe, read-only queries are executed and blocks potentially
 dangerous operations.
+
+The security policy itself lives in composable rule objects
+(:mod:`pg_mcp.services.validation_rules`); this module owns parsing, statement
+routing (EXPLAIN / CTE handling), and the rule pipeline.
 """
 
 from typing import ClassVar
@@ -12,21 +16,35 @@ from sqlglot import exp
 
 from pg_mcp.config.settings import SecurityConfig
 from pg_mcp.models.errors import SecurityViolationError, SQLParseError
+from pg_mcp.services.validation_rules import (
+    ALLOWED_STATEMENT_TYPES,
+    FORBIDDEN_STATEMENT_TYPES,
+    BlockedColumnRule,
+    BlockedTableRule,
+    DangerousFunctionRule,
+    StatementTypeRule,
+    SubquerySafetyRule,
+    ValidationRule,
+    check_subquery_safety,
+)
 
 
 class SQLValidator:
     """SQL security validator using SQLGlot for parsing and validation.
 
-    This validator ensures queries are safe by:
-    - Allowing only SELECT statements
-    - Blocking dangerous functions (pg_sleep, file operations, etc.)
-    - Preventing access to blocked tables and columns
-    - Rejecting multi-statement queries
-    - Validating subquery safety
+    This validator ensures queries are safe by composing security rules that:
+    - Allow only SELECT statements
+    - Block dangerous functions (pg_sleep, file operations, etc.)
+    - Prevent access to blocked tables and columns
+    - Reject multi-statement queries
+    - Validate subquery safety
     """
 
     # Allowed statement types at the top level (including set operations)
-    ALLOWED_STATEMENT_TYPES: ClassVar = {exp.Select, exp.Union, exp.Intersect, exp.Except}
+    ALLOWED_STATEMENT_TYPES: ClassVar = ALLOWED_STATEMENT_TYPES
+
+    # Forbidden statement types
+    FORBIDDEN_STATEMENT_TYPES: ClassVar = FORBIDDEN_STATEMENT_TYPES
 
     # Allowed top-level expressions (including CTEs)
     ALLOWED_TOP_LEVEL: ClassVar = {
@@ -36,22 +54,6 @@ class SQLValidator:
         exp.Except,
         exp.With,
         exp.Subquery,
-    }
-
-    # Forbidden statement types
-    FORBIDDEN_STATEMENT_TYPES: ClassVar = {
-        exp.Insert,
-        exp.Update,
-        exp.Delete,
-        exp.Drop,
-        exp.Create,
-        exp.Alter,
-        exp.Grant,
-        exp.Revoke,
-        exp.Set,
-        exp.Command,
-        exp.Use,
-        exp.Merge,
     }
 
     # Built-in dangerous PostgreSQL functions
@@ -101,6 +103,15 @@ class SQLValidator:
         self.blocked_functions = self.BUILTIN_DANGEROUS_FUNCTIONS | {
             f.lower() for f in config.blocked_functions
         }
+
+        # Security rules in evaluation order; the first violation wins.
+        self._rules: list[ValidationRule] = [
+            StatementTypeRule(),
+            DangerousFunctionRule(blocked_functions=frozenset(self.blocked_functions)),
+            BlockedTableRule(blocked_tables=frozenset(self.blocked_tables)),
+            BlockedColumnRule(blocked_columns=frozenset(self.blocked_columns)),
+            SubquerySafetyRule(),
+        ]
 
     def validate(self, sql: str) -> tuple[bool, str | None]:
         """Validate SQL query for security compliance.
@@ -180,110 +191,11 @@ class SQLValidator:
         else:
             main_query = statement
 
-        # Perform security checks
-        if error := self._check_statement_type(main_query):
-            raise SecurityViolationError(error)
-
-        if error := self._check_dangerous_functions(statement):
-            raise SecurityViolationError(error)
-
-        if error := self._check_blocked_tables(statement):
-            raise SecurityViolationError(error)
-
-        if error := self._check_blocked_columns(statement):
-            raise SecurityViolationError(error)
-
-        if error := self._check_subquery_safety(statement):
-            raise SecurityViolationError(error)
-
-    def _check_statement_type(self, statement: exp.Expression) -> str | None:
-        """Check if statement type is allowed.
-
-        Args:
-            statement: Parsed SQL statement.
-
-        Returns:
-            Error message if check fails, None otherwise.
-        """
-        # Check for forbidden statement types
-        for forbidden_type in self.FORBIDDEN_STATEMENT_TYPES:
-            if isinstance(statement, forbidden_type):
-                stmt_name = forbidden_type.__name__.upper()
-                return f"{stmt_name} statements are not allowed. Only SELECT queries are permitted."
-
-        # Ensure statement is an allowed type (SELECT or set operations)
-        if not isinstance(statement, tuple(self.ALLOWED_STATEMENT_TYPES)):
-            stmt_type = type(statement).__name__
-            return f"Statement type {stmt_type} is not allowed. Only SELECT queries are permitted."
-
-        return None
-
-    def _check_dangerous_functions(self, statement: exp.Expression) -> str | None:
-        """Check for use of blocked/dangerous functions.
-
-        Args:
-            statement: Parsed SQL statement.
-
-        Returns:
-            Error message if check fails, None otherwise.
-        """
-        # Find all function calls in the query
-        for func in statement.find_all(exp.Func):
-            func_name = func.name.lower() if func.name else ""
-
-            if func_name in self.blocked_functions:
-                return f"Function '{func_name}' is blocked for security reasons"
-
-        return None
-
-    def _check_blocked_tables(self, statement: exp.Expression) -> str | None:
-        """Check for access to blocked tables.
-
-        Args:
-            statement: Parsed SQL statement.
-
-        Returns:
-            Error message if check fails, None otherwise.
-        """
-        if not self.blocked_tables:
-            return None
-
-        # Find all table references
-        for table in statement.find_all(exp.Table):
-            table_name = table.name.lower() if table.name else ""
-
-            if table_name in self.blocked_tables:
-                return f"Access to table '{table_name}' is not allowed"
-
-        return None
-
-    def _check_blocked_columns(self, statement: exp.Expression) -> str | None:
-        """Check for access to blocked columns.
-
-        Args:
-            statement: Parsed SQL statement.
-
-        Returns:
-            Error message if check fails, None otherwise.
-        """
-        if not self.blocked_columns:
-            return None
-
-        # Find all column references
-        for column in statement.find_all(exp.Column):
-            column_name = column.name.lower() if column.name else ""
-
-            # Check for exact match
-            if column_name in self.blocked_columns:
-                return f"Access to column '{column_name}' is not allowed"
-
-            # Check for qualified column names (table.column)
-            if column.table:
-                qualified_name = f"{column.table.lower()}.{column_name}"
-                if qualified_name in self.blocked_columns:
-                    return f"Access to column '{qualified_name}' is not allowed"
-
-        return None
+        # Perform security checks: each rule returns an error message on the
+        # first violation, evaluated in pipeline order.
+        for rule in self._rules:
+            if error := rule.check(statement=statement, main_query=main_query):
+                raise SecurityViolationError(error)
 
     def _check_subquery_safety(self, statement: exp.Expression) -> str | None:
         """Check that all subqueries and CTE bodies contain read-only queries.
@@ -298,27 +210,7 @@ class SQLValidator:
         Returns:
             Error message if check fails, None otherwise.
         """
-        # Check all nested queries (CTE bodies and parenthesized subqueries)
-        nested = [cte.this for cte in statement.find_all(exp.CTE) if cte.this] + [
-            subquery.this for subquery in statement.find_all(exp.Subquery) if subquery.this
-        ]
-
-        for inner_stmt in nested:
-            # Check if the inner statement is a forbidden type
-            for forbidden_type in self.FORBIDDEN_STATEMENT_TYPES:
-                if isinstance(inner_stmt, forbidden_type):
-                    stmt_name = forbidden_type.__name__.upper()
-                    return f"{stmt_name} statements in subqueries are not allowed"
-
-            # Ensure it's a read-only query (set operations and nested
-            # WITH clauses are read-only, matching the top-level policy)
-            if not isinstance(
-                inner_stmt,
-                (exp.Select, exp.Union, exp.Intersect, exp.Except, exp.With),
-            ):
-                return "Subqueries must contain only SELECT statements"
-
-        return None
+        return check_subquery_safety(statement)
 
     def normalize_sql(self, sql: str) -> str:
         """Normalize SQL query to a canonical form.

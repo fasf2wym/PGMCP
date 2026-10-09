@@ -11,10 +11,12 @@ from typing import Any
 
 from asyncpg import Pool
 from mcp.server.fastmcp import FastMCP
+from openai import AsyncOpenAI
 
 from pg_mcp.cache.schema_cache import SchemaCache
 from pg_mcp.config.settings import Settings
 from pg_mcp.db.pool import close_pools, create_pools
+from pg_mcp.llm import create_openai_client
 from pg_mcp.models.query import QueryRequest, QueryResponse, ReturnType
 from pg_mcp.observability.logging import configure_logging, get_logger
 from pg_mcp.observability.metrics import MetricsCollector
@@ -33,6 +35,7 @@ _pools: dict[str, Pool] | None = None
 _schema_cache: SchemaCache | None = None
 _orchestrator: QueryOrchestrator | None = None
 _rate_limiter: MultiRateLimiter | None = None
+_llm_client: AsyncOpenAI | None = None
 
 
 @asynccontextmanager
@@ -60,7 +63,7 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:
     Yields:
         None
     """
-    global _settings, _pools, _schema_cache, _orchestrator, _rate_limiter
+    global _settings, _pools, _schema_cache, _orchestrator, _rate_limiter, _llm_client
 
     logger.info("Starting PostgreSQL MCP Server initialization...")
 
@@ -140,8 +143,12 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:
         # 6. Create service components
         logger.info("Initializing service components...")
 
+        # Shared OpenAI client (each service applies its own per-request
+        # timeout, so generation and validation keep their configured limits)
+        _llm_client = create_openai_client(_settings.openai, _settings.openai.timeout)
+
         # SQL Generator
-        sql_generator = SQLGenerator(_settings.openai)
+        sql_generator = SQLGenerator(_settings.openai, client=_llm_client)
 
         # SQL Validator (security controls from configuration)
         sql_validator = SQLValidator(
@@ -166,6 +173,7 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:
         result_validator = ResultValidator(
             openai_config=_settings.openai,
             validation_config=_settings.validation,
+            client=_llm_client,
         )
 
         # 7. Initialize resilience components
@@ -231,6 +239,14 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:
                 logger.info("Database connection pools closed")
             except Exception as e:
                 logger.error(f"Error closing connection pools: {e!s}")
+
+        # Close the shared OpenAI client
+        if _llm_client is not None:
+            try:
+                await _llm_client.close()
+                logger.info("Shared OpenAI client closed")
+            except Exception as e:
+                logger.warning(f"Error closing OpenAI client: {e!s}")
 
         logger.info("PostgreSQL MCP Server shutdown complete")
 

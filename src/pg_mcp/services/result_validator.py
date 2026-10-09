@@ -10,7 +10,8 @@ from typing import TYPE_CHECKING, Any
 from openai import AsyncOpenAI
 
 from pg_mcp.config.settings import OpenAIConfig, ValidationConfig
-from pg_mcp.models.errors import LLMError, LLMTimeoutError, LLMUnavailableError
+from pg_mcp.llm import create_openai_client, translate_openai_error
+from pg_mcp.models.errors import LLMError, LLMTimeoutError
 from pg_mcp.models.query import ResultValidationResult
 from pg_mcp.prompts.result_validation import (
     RESULT_VALIDATION_SYSTEM_PROMPT,
@@ -44,19 +45,25 @@ class ResultValidator:
         self,
         openai_config: OpenAIConfig,
         validation_config: ValidationConfig,
+        client: AsyncOpenAI | None = None,
     ) -> None:
         """Initialize result validator with OpenAI and validation configuration.
 
         Args:
             openai_config: OpenAI configuration including API key and model settings.
             validation_config: Validation configuration including thresholds and timeouts.
+            client: Optional pre-configured ``AsyncOpenAI`` client to share
+                across services. A per-request timeout is applied on every
+                call, so a shared client still honors
+                ``validation_config.timeout_seconds``. Defaults to a client
+                built with the validation timeout.
         """
         self.openai_config = openai_config
         self.validation_config = validation_config
-        self.client = AsyncOpenAI(
-            api_key=openai_config.api_key.get_secret_value(),
-            base_url=openai_config.base_url,
-            timeout=validation_config.timeout_seconds,
+        self.client = (
+            client
+            if client is not None
+            else create_openai_client(openai_config, validation_config.timeout_seconds)
         )
 
     async def validate(
@@ -128,9 +135,24 @@ class ResultValidator:
                 max_tokens=500,
                 temperature=0.0,  # Use deterministic output for validation
                 response_format={"type": "json_object"},  # Ensure JSON response
+                timeout=self.validation_config.timeout_seconds,
             )
 
             # Extract and parse the response
+            if not hasattr(response, "choices"):
+                # Misconfigured base_url or incompatible gateway: the SDK
+                # hands back the raw body (e.g. an HTML page as a string).
+                # Non-blocking by contract: degrade to moderate confidence.
+                return ResultValidationResult(
+                    confidence=60,
+                    explanation=(
+                        "Validation response was not a standard completion - "
+                        "check that OPENAI_BASE_URL points to the API root (e.g. /v1)"
+                    ),
+                    suggestion="Manual verification recommended",
+                    is_acceptable=False,
+                )
+
             if not response.choices:
                 raise LLMError(
                     message="OpenAI returned empty response for result validation",
@@ -197,19 +219,6 @@ class ResultValidator:
             # Re-raise LLM errors as-is
             raise
         except Exception as e:
-            # Handle various OpenAI errors
-            error_msg = str(e)
-            if "authentication" in error_msg.lower() or "api_key" in error_msg.lower():
-                raise LLMUnavailableError(
-                    message="OpenAI API authentication failed - check API key",
-                    details={"error": error_msg},
-                ) from e
-            if "rate_limit" in error_msg.lower():
-                raise LLMUnavailableError(
-                    message="OpenAI API rate limit exceeded",
-                    details={"error": error_msg},
-                ) from e
-            raise LLMError(
-                message=f"Result validation failed: {error_msg}",
-                details={"error": error_msg},
-            ) from e
+            # Classify via the shared OpenAI error translation (typed
+            # exceptions first, message-substring fallback).
+            raise translate_openai_error(e, "Result validation") from e

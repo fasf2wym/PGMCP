@@ -282,7 +282,7 @@ Return Type: sql
 - **限流**：防止 API 配额耗尽
 - **重试逻辑**：自动重试瞬时故障，使用指数退避
 - **连接池**：高效的数据库连接复用
-- **Schema 缓存**：基于 TTL 的缓存减少数据库元数据查询
+- **Schema 缓存**：基于 TTL 的缓存减少数据库元数据查询；Schema 内省使用批量集合查询（每类元数据一条 SQL），启动开销与表数量无关
 
 ## 配置参考
 
@@ -396,15 +396,17 @@ pg-mcp/
 ├── src/pg_mcp/
 │   ├── cache/              # Schema 缓存
 │   ├── config/             # 配置管理
-│   ├── db/                 # 数据库连接池
+│   ├── db/                 # 数据库连接池 + Schema 批量内省
+│   ├── llm/                # 共享 OpenAI 客户端工厂与异常翻译
 │   ├── models/             # 数据模型
 │   ├── observability/      # 日志、指标、追踪
 │   ├── prompts/            # LLM Prompt 模板
 │   ├── resilience/         # 熔断器、限流器
 │   ├── services/           # 核心业务逻辑
 │   │   ├── orchestrator.py      # 查询协调
-│   │   ├── sql_generator.py     # 基于 LLM 的 SQL 生成
-│   │   ├── sql_validator.py     # 安全验证
+│   │   ├── sql_generator.py     # 基于 LLM 的 SQL 生成 (结构化 JSON 输出)
+│   │   ├── validation_rules.py  # 可组合的 SQL 安全规则
+│   │   ├── sql_validator.py     # 安全验证 (规则管线)
 │   │   ├── sql_executor.py      # 查询执行
 │   │   └── result_validator.py  # 结果验证
 │   └── server.py           # FastMCP 服务器

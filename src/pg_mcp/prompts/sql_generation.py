@@ -25,16 +25,13 @@ Your task is to convert natural language questions into valid PostgreSQL SQL que
 8. Use appropriate aggregation functions (COUNT, SUM, AVG, etc.) when needed
 
 ## Output Format:
-Return ONLY the SQL query wrapped in ```sql ... ``` code block.
-Do not include any explanation before or after the SQL.
+Return ONLY a JSON object: {"sql": "<the complete SQL query>"}
+Do not include any explanation, markdown fences, or keys other than "sql".
 
 ## Example:
 User: 查询过去7天的订单数量
-```sql
-SELECT COUNT(*) AS order_count
-FROM orders
-WHERE created_at >= CURRENT_DATE - INTERVAL '7 days';
-```
+Assistant:
+{"sql": "SELECT COUNT(*) FROM orders WHERE created_at >= CURRENT_DATE - INTERVAL '7 days';"}
 """
 
 

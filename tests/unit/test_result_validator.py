@@ -193,3 +193,27 @@ class TestResultValidator:
         # The user prompt should mention only the 2 sampled rows
         user_prompt = mock_create.call_args.kwargs["messages"][1]["content"]
         assert "showing 2 of 10 rows" in user_prompt
+
+
+@pytest.mark.asyncio
+async def test_non_standard_response_degrades_gracefully() -> None:
+    """A non-ChatCompletion body (e.g. HTML from a wrong base_url) degrades to confidence 60."""
+    validator = ResultValidator(
+        openai_config=OpenAIConfig(api_key="sk-test"),
+        validation_config=ValidationConfig(),
+    )
+    mock_response = MagicMock(content="not a completion object", spec=["content"])
+
+    with patch.object(
+        validator.client.chat.completions, "create", new=AsyncMock(return_value=mock_response)
+    ):
+        result = await validator.validate(
+            question="Count users",
+            sql="SELECT COUNT(*) FROM users",
+            results=[{"count": 1}],
+            row_count=1,
+        )
+
+    assert result.confidence == 60
+    assert result.is_acceptable is False
+    assert "non-standard" in result.explanation or "OPENAI_BASE_URL" in result.explanation

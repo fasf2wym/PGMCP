@@ -9,7 +9,7 @@ PostgreSQL MCP Server 是一个基于 Model Context Protocol 的智能数据库�
 - **Python**: 3.12+
 - **MCP SDK**: FastMCP
 - **PostgreSQL Driver**: asyncpg (异步) 或 psycopg3
-- **SQL Parser**: pglast (PostgreSQL 专用解析器)
+- **SQL Parser**: SQLGlot (支持 PostgreSQL 方言的解析器)
 - **LLM**: OpenAI SDK (gpt-5.2-mini)
 - **配置管理**: pydantic-settings
 - **测试**: pytest + pytest-asyncio + pytest-cov
@@ -64,19 +64,26 @@ class SchemaColumn:
 #### Single Responsibility (单一职责)
 
 ```
-src/
-├── core/
-│   ├── schema_cache.py      # 仅负责 Schema 缓存管理
-│   ├── sql_generator.py     # 仅负责 SQL 生成 (LLM 调用)
-│   ├── sql_validator.py     # 仅负责 SQL 安全验证
-│   ├── sql_executor.py      # 仅负责 SQL 执行
-│   └── result_validator.py  # 仅负责结果验证
+src/pg_mcp/
+├── cache/
+│   └── schema_cache.py      # 仅负责 Schema 缓存管理
+├── db/
+│   ├── introspection.py     # 仅负责 Schema 内省 (批量集合查询)
+│   └── pool.py              # 仅负责连接池管理
+├── llm/
+│   ├── client.py            # 仅负责 OpenAI 客户端构建 (共享工厂)
+│   └── errors.py            # 仅负责 OpenAI 异常翻译
 ├── models/
 │   ├── schema.py            # Schema 相关数据模型
 │   ├── query.py             # 查询请求/响应模型
 │   └── errors.py            # 错误定义
 ├── services/
-│   └── query_service.py     # 编排各个组件的服务层
+│   ├── orchestrator.py      # 编排各个组件的服务层
+│   ├── sql_generator.py     # 仅负责 SQL 生成 (LLM 调用)
+│   ├── validation_rules.py  # 仅负责单条安全规则 (可组合)
+│   ├── sql_validator.py     # 仅负责 SQL 安全验证 (规则管线)
+│   ├── sql_executor.py      # 仅负责 SQL 执行
+│   └── result_validator.py  # 仅负责结果验证
 └── config/
     └── settings.py          # 配置管理
 ```
@@ -238,17 +245,18 @@ class QueryRequest(BaseModel):
         # 移除潜在的 prompt injection
         return sanitize_user_input(v)
 
-# 3. 使用 pglast 解析和验证 SQL
-from pglast import parse_sql, Node
+# 3. 使用 sqlglot 解析和验证 SQL
+import sqlglot
+from sqlglot import exp
 
 def validate_sql(sql: str) -> bool:
     try:
-        stmts = parse_sql(sql)
+        stmts = sqlglot.parse(sql, read="postgres")
         for stmt in stmts:
-            if not isinstance(stmt.stmt, SelectStmt):
+            if not isinstance(stmt, exp.Select):
                 raise SecurityViolationError("Only SELECT allowed")
         return True
-    except ParseError:
+    except sqlglot.errors.ParseError:
         raise SQLParseError("Invalid SQL syntax")
 ```
 
@@ -262,6 +270,7 @@ tests/
 ├── unit/
 │   ├── test_sql_validator.py
 │   ├── test_sql_generator.py
+│   ├── test_llm.py          # LLM 客户端工厂与异常翻译
 │   └── test_schema_cache.py
 ├── integration/
 │   ├── test_query_flow.py
@@ -282,7 +291,7 @@ tests/
 ```python
 # tests/unit/test_sql_validator.py
 import pytest
-from src.core.sql_validator import SQLValidator, SecurityViolationError
+from pg_mcp.services.sql_validator import SQLValidator, SecurityViolationError
 
 class TestSQLValidator:
     @pytest.fixture
@@ -427,7 +436,7 @@ requires-python = ">=3.12"
 dependencies = [
     "fastmcp>=2.14.1",
     "asyncpg>=0.29.0",
-    "pglast>=6.0",
+    "sqlglot>=28.5.0",
     "openai>=1.0.0",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
